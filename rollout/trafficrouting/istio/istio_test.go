@@ -4143,3 +4143,235 @@ spec:
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to update kubernetes virtual service")
 }
+
+// rewriteVsvc mirrors the VirtualService from #3088: the application is exposed on a subpath
+// and the managed route rewrites it away before forwarding, alongside a few other settings
+// that describe how the request is forwarded rather than which requests match.
+const rewriteVsvc = `
+apiVersion: networking.istio.io/v1alpha3
+kind: VirtualService
+metadata:
+  name: vsvc
+  namespace: default
+spec:
+  gateways:
+  - demo-gateway
+  hosts:
+  - xyz.demo.com
+  http:
+  - name: primary
+    match:
+    - uri:
+        exact: /demo
+    rewrite:
+      uri: /
+    timeout: 5s
+    retries:
+      attempts: 3
+      perTryTimeout: 2s
+    headers:
+      request:
+        set:
+          x-forwarded-by: rollouts
+    corsPolicy:
+      allowOrigins:
+      - exact: https://xyz.demo.com
+    fault:
+      abort:
+        httpStatus: 500
+        percentage:
+          value: 1
+    route:
+    - destination:
+        host: stable
+      weight: 100
+    - destination:
+        host: canary
+      weight: 0
+`
+
+// httpRouteMap returns the raw map for the named route. The typed VirtualServiceHTTPRoute
+// models only name/match/route/mirror, so anything inherited from the managed route has to be
+// read off the unstructured object.
+func httpRouteMap(t *testing.T, modifiedObj *unstructured.Unstructured, routeName string) map[string]any {
+	t.Helper()
+	routes, ok, err := unstructured.NestedSlice(modifiedObj.Object, "spec", "http")
+	assert.Nil(t, err)
+	assert.True(t, ok)
+	for _, route := range routes {
+		routeMap, ok := route.(map[string]any)
+		if !ok {
+			t.Fatalf("could not cast http route to map[string]any")
+		}
+		if routeMap["name"] == routeName {
+			return routeMap
+		}
+	}
+	t.Fatalf("route %q not found in virtual service", routeName)
+	return nil
+}
+
+// TestHttpReconcileHeaderRouteInheritsManagedRouteSettings covers #3088: a header route sent to
+// a canary that is reached through a rewrite has to rewrite too, otherwise every header matched
+// request arrives at the canary with a path it does not serve.
+func TestHttpReconcileHeaderRouteInheritsManagedRouteSettings(t *testing.T) {
+	ro := rolloutWithHttpRoutes("stable", "canary", "vsvc", []string{"primary"})
+	obj := unstructuredutil.StrToUnstructuredUnsafe(rewriteVsvc)
+	client := testutil.NewFakeDynamicClient(obj)
+	vsvcLister, druleLister := getIstioListers(client)
+	r := NewReconciler(ro, client, record.NewFakeEventRecorder(), vsvcLister, druleLister, nil)
+	client.ClearActions()
+
+	const headerName = "test-header-route"
+	r.rollout.Spec.Strategy.Canary.TrafficRouting.ManagedRoutes = append(r.rollout.Spec.Strategy.Canary.TrafficRouting.ManagedRoutes, v1alpha1.MangedRoutes{
+		Name: headerName,
+	})
+
+	err := r.SetHeaderRoute(&v1alpha1.SetHeaderRoute{
+		Name: headerName,
+		Match: []v1alpha1.HeaderRoutingMatch{{
+			HeaderName:  "canary",
+			HeaderValue: &v1alpha1.StringMatch{Exact: "canary-tester"},
+		}},
+	})
+	assert.Nil(t, err)
+
+	iVirtualService, err := client.Resource(istioutil.GetIstioVirtualServiceGVR()).Namespace(r.rollout.Namespace).Get(context.TODO(), ro.Spec.Strategy.Canary.TrafficRouting.Istio.VirtualService.Name, metav1.GetOptions{})
+	assert.NoError(t, err)
+
+	primary := httpRouteMap(t, iVirtualService, "primary")
+	headerRoute := httpRouteMap(t, iVirtualService, headerName)
+
+	// The request shaping settings come across from the managed route unchanged.
+	for _, field := range []string{"rewrite", "timeout", "retries", "headers", "corsPolicy"} {
+		assert.Equal(t, primary[field], headerRoute[field], "field %q", field)
+	}
+
+	// Matching and routing stay the header route's own, and fault injection is not duplicated.
+	assert.NotEqual(t, primary["match"], headerRoute["match"])
+	assert.NotContains(t, headerRoute, "fault")
+	assert.NotContains(t, headerRoute, "mirror")
+
+	// The managed route itself is untouched.
+	assert.Equal(t, "/", primary["rewrite"].(map[string]any)["uri"])
+
+	// Inheriting is by value, not by reference: editing the header route's copy must not
+	// reach back into the managed route.
+	headerRoute["rewrite"].(map[string]any)["uri"] = "/mutated"
+	assert.Equal(t, "/", primary["rewrite"].(map[string]any)["uri"])
+
+	// The header route still points all of its traffic at the canary.
+	httpRoutes := extractHttpRoutes(t, iVirtualService)
+	assert.Equal(t, headerName, httpRoutes[0].Name)
+	checkDestination(t, httpRoutes[0].Route, "canary", 100)
+}
+
+// TestHttpReconcileMirrorRouteInheritsManagedRouteSettings covers the same gap for mirror
+// routes, which reuse the managed route's destinations and so need its rewrite just as much.
+func TestHttpReconcileMirrorRouteInheritsManagedRouteSettings(t *testing.T) {
+	ro := rolloutWithHttpRoutes("stable", "canary", "vsvc", []string{"primary"})
+	obj := unstructuredutil.StrToUnstructuredUnsafe(rewriteVsvc)
+	client := testutil.NewFakeDynamicClient(obj)
+	vsvcLister, druleLister := getIstioListers(client)
+	r := NewReconciler(ro, client, record.NewFakeEventRecorder(), vsvcLister, druleLister, nil)
+	client.ClearActions()
+
+	const mirrorName = "test-mirror-route"
+	r.rollout.Spec.Strategy.Canary.TrafficRouting.ManagedRoutes = append(r.rollout.Spec.Strategy.Canary.TrafficRouting.ManagedRoutes, v1alpha1.MangedRoutes{
+		Name: mirrorName,
+	})
+
+	err := r.SetMirrorRoute(&v1alpha1.SetMirrorRoute{
+		Name: mirrorName,
+		Match: []v1alpha1.RouteMatch{{
+			Method: &v1alpha1.StringMatch{Exact: "GET"},
+		}},
+	})
+	assert.Nil(t, err)
+
+	iVirtualService, err := client.Resource(istioutil.GetIstioVirtualServiceGVR()).Namespace(r.rollout.Namespace).Get(context.TODO(), ro.Spec.Strategy.Canary.TrafficRouting.Istio.VirtualService.Name, metav1.GetOptions{})
+	assert.NoError(t, err)
+
+	primary := httpRouteMap(t, iVirtualService, "primary")
+	mirrorRoute := httpRouteMap(t, iVirtualService, mirrorName)
+
+	assert.Equal(t, primary["rewrite"], mirrorRoute["rewrite"])
+	assert.Equal(t, primary["timeout"], mirrorRoute["timeout"])
+	// SetMirrorRoute owns the mirror fields, so they are the route's own rather than inherited.
+	assert.Contains(t, mirrorRoute, "mirror")
+	assert.NotContains(t, primary, "mirror")
+}
+
+// ambiguousRewriteVsvc has two named routes that both rewrite, and is used with a Rollout that
+// does not list virtualService.routes, so there is no way to tell which route Rollouts manages.
+const ambiguousRewriteVsvc = `apiVersion: networking.istio.io/v1alpha3
+kind: VirtualService
+metadata:
+  name: vsvc
+  namespace: default
+spec:
+  gateways:
+  - istio-rollout-gateway
+  hosts:
+  - istio-rollout.dev.argoproj.io
+  http:
+  - name: primary
+    rewrite:
+      uri: /primary
+    route:
+    - destination:
+        host: 'stable'
+      weight: 100
+    - destination:
+        host: canary
+      weight: 0
+  - name: secondary
+    rewrite:
+      uri: /secondary
+    route:
+    - destination:
+        host: 'stable'
+      weight: 100
+    - destination:
+        host: canary
+      weight: 0`
+
+// TestHttpReconcileHeaderRouteInheritsNothingWhenManagedRouteIsAmbiguous asserts the fallback:
+// with several named routes and no virtualService.routes to say which one Rollouts manages,
+// the header route is built from the Rollout spec alone rather than guessing.
+func TestHttpReconcileHeaderRouteInheritsNothingWhenManagedRouteIsAmbiguous(t *testing.T) {
+	ro := rolloutWithHttpRoutes("stable", "canary", "vsvc", nil)
+	obj := unstructuredutil.StrToUnstructuredUnsafe(ambiguousRewriteVsvc)
+	client := testutil.NewFakeDynamicClient(obj)
+	vsvcLister, druleLister := getIstioListers(client)
+	r := NewReconciler(ro, client, record.NewFakeEventRecorder(), vsvcLister, druleLister, nil)
+	client.ClearActions()
+
+	const headerName = "test-header-route"
+	r.rollout.Spec.Strategy.Canary.TrafficRouting.ManagedRoutes = append(r.rollout.Spec.Strategy.Canary.TrafficRouting.ManagedRoutes, v1alpha1.MangedRoutes{
+		Name: headerName,
+	})
+
+	err := r.SetHeaderRoute(&v1alpha1.SetHeaderRoute{
+		Name: headerName,
+		Match: []v1alpha1.HeaderRoutingMatch{{
+			HeaderName:  "agent",
+			HeaderValue: &v1alpha1.StringMatch{Exact: "firefox"},
+		}},
+	})
+	assert.Nil(t, err)
+
+	iVirtualService, err := client.Resource(istioutil.GetIstioVirtualServiceGVR()).Namespace(r.rollout.Namespace).Get(context.TODO(), ro.Spec.Strategy.Canary.TrafficRouting.Istio.VirtualService.Name, metav1.GetOptions{})
+	assert.NoError(t, err)
+
+	headerRoute := httpRouteMap(t, iVirtualService, headerName)
+	assert.ElementsMatch(t, []string{"name", "match", "route"}, mapKeys(headerRoute))
+}
+
+func mapKeys(m map[string]any) []string {
+	keys := make([]string, 0, len(m))
+	for key := range m {
+		keys = append(keys, key)
+	}
+	return keys
+}

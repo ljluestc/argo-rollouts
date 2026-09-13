@@ -382,6 +382,50 @@ spec:
           weight: 0
 ```
 
+## Header and Mirror Routes
+
+The `setHeaderRoute` and `setMirrorRoute` steps add an extra HTTP route to the VirtualService for
+the duration of the rollout. That route sits above the route Argo Rollouts manages and sends the
+traffic it matches to the canary, so it has to forward requests the same way the managed route
+does. It therefore inherits the following fields from the managed route:
+
+* `rewrite`
+* `timeout`
+* `retries`
+* `headers`
+* `corsPolicy`
+
+For example, if the managed route exposes the application on a subpath and rewrites it away:
+
+```yaml
+  http:
+  - name: primary
+    match:
+    - uri:
+        exact: /demo
+    rewrite:
+      uri: /
+    route:
+    - destination:
+        host: stable-svc
+      weight: 100
+    - destination:
+        host: canary-svc
+      weight: 0
+```
+
+then the generated header route rewrites too, and header-matched requests reach the canary on `/`
+rather than on `/demo`, which the application does not serve.
+
+`match` and `route` are always the generated route's own, and `fault` is not inherited: fault
+injection stays on the route it was configured on rather than being applied to an additional
+route. The managed route itself is never modified.
+
+Inheritance needs to know which route is the managed one. If the VirtualService has a single
+route, or `spec.strategy.canary.trafficRouting.istio.virtualService.routes` names it, that is
+unambiguous. If several named routes exist and `routes` is not set, no settings are inherited,
+the same condition under which the canary port cannot be inherited either.
+
 ## Multicluster Setup
 If you have [Istio multicluster setup](https://istio.io/latest/docs/setup/install/multicluster/)
 where the primary Istio cluster is different from the cluster where the Argo Rollout controller

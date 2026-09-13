@@ -19,6 +19,7 @@ import (
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/dynamic/dynamiclister"
 
@@ -922,6 +923,62 @@ func (r *Reconciler) getDestinationRule(dRuleSpec *v1alpha1.IstioDestinationRule
 	return origBytes, dRule, dRuleNew, nil
 }
 
+// managedRouteInheritedFields are the HTTPRoute settings that a generated header or mirror
+// route copies from the route Rollouts manages. They describe how a matched request is
+// forwarded rather than which requests match or where they go, so a generated route that
+// leaves them out hands the canary a different request than the stable service ever sees.
+// The reported case is rewrite: a managed route rewriting /demo to / left header matched
+// requests arriving at the canary still asking for /demo, which it does not serve.
+//
+// Deliberately not inherited: name, match and route, which the generated route defines
+// itself; mirror, mirrorPercentage and mirror_percent, which belong to SetMirrorRoute and
+// would otherwise mirror a request twice; delegate, which is mutually exclusive with route;
+// and fault, which is deliberate fault injection whose blast radius should not grow by an
+// extra route without the user asking for it.
+var managedRouteInheritedFields = []string{
+	"rewrite",
+	"timeout",
+	"retries",
+	"headers",
+	"corsPolicy",
+}
+
+// inheritManagedRouteSettings copies the managedRouteInheritedFields set on the route Rollouts
+// manages in this VirtualService onto a route Rollouts generates. Fields the generated route
+// already defines are left alone.
+//
+// It is a no-op when the managed route cannot be identified, which is the same condition under
+// which the canary port cannot be inherited either: several named routes and no
+// spec.strategy.canary.trafficRouting.istio.virtualService.routes to say which one is ours. In
+// that case the generated route is built from the Rollout spec alone, exactly as before.
+func inheritManagedRouteSettings(generatedRoute map[string]any, unVsvc *unstructured.Unstructured, virtualService v1alpha1.IstioVirtualService) {
+	httpRoutes, httpRoutesI, err := getVirtualServiceHttpRoutes(unVsvc)
+	if err != nil {
+		log.Warnf("[inheritManagedRouteSettings] failed to get virtual service http routes: %v", err)
+		return
+	}
+
+	routeIndexes, err := getHttpRouteIndexesToPatch(virtualService.Routes, httpRoutes)
+	if err != nil || len(routeIndexes) == 0 {
+		return
+	}
+	managedRoute, ok := httpRoutesI[routeIndexes[0]].(map[string]any)
+	if !ok {
+		return
+	}
+
+	for _, field := range managedRouteInheritedFields {
+		value, found := managedRoute[field]
+		if !found {
+			continue
+		}
+		if _, alreadySet := generatedRoute[field]; alreadySet {
+			continue
+		}
+		generatedRoute[field] = runtime.DeepCopyJSONValue(value)
+	}
+}
+
 func createHeaderRoute(virtualService v1alpha1.IstioVirtualService, unVsvc *unstructured.Unstructured, headerRouting *v1alpha1.SetHeaderRoute, host string, subset string) map[string]any {
 	var routeMatches []any
 	for _, hrm := range headerRouting.Match {
@@ -935,11 +992,14 @@ func createHeaderRoute(virtualService v1alpha1.IstioVirtualService, unVsvc *unst
 
 	canaryDestination := routeDestination(host, port.Number, subset, 100)
 
-	return map[string]any{
+	headerRoute := map[string]any{
 		"name":  headerRouting.Name,
 		"match": routeMatches,
 		"route": []any{canaryDestination},
 	}
+	inheritManagedRouteSettings(headerRoute, unVsvc, virtualService)
+
+	return headerRoute
 }
 
 func createHeaderRouteMatch(hrm v1alpha1.HeaderRoutingMatch) any {
@@ -1325,6 +1385,7 @@ func (r *Reconciler) reconcileVirtualServiceMirrorRoutes(virtualService v1alpha1
 	if err != nil {
 		return fmt.Errorf("[reconcileVirtualServiceMirrorRoutes] failed to create mirror route: %w", err)
 	}
+	inheritManagedRouteSettings(mR, istioVirtualService, virtualService)
 
 	vsRoutes, found, err := unstructured.NestedSlice(istioVirtualService.Object, "spec", Http)
 	if err != nil {
